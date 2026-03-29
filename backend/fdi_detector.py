@@ -1,24 +1,53 @@
+# ---------------------------------------------------------
+# FDI (FALSE DATA INJECTION) DETECTOR  –  ML-Enhanced
+# ---------------------------------------------------------
+# Combines two detection strategies:
+#   1. Statistical Z-score anomaly detection (original)
+#   2. Isolation Forest ML model (new) that learns normal
+#      consumption patterns and flags outliers.
+#
+# The ML model trains itself automatically once enough
+# readings have been collected (ML_MIN_TRAINING_SAMPLES).
+# ---------------------------------------------------------
+
 import numpy as np
+from sklearn.ensemble import IsolationForest
 from config import Config
 from database import get_connection
-from crypto_utils import verify_signature
+from crypto_utils import verify_signature, record_failure
 
 
 class FDIDetector:
     """
     FDI (False Data Injection) Detector
-    This class looks at the stream of energy readings and uses statistics 
-    (specifically Z-scores) to decide if a reading is abnormal.
+    Uses both Z-score statistics AND an Isolation Forest ML model
+    to identify abnormal energy consumption readings.
     """
 
     def __init__(self):
-        # Dictionary to store recent readings for each device
+        # Per-device rolling window for Z-score baseline
         self.baselines = {}
+        # Per-device training data for the ML model
+        self._training_data = {}
+        # Per-device trained Isolation Forest models
+        self._ml_models = {}
+        # Track whether defense mode is active
+        self.defense_active = True
+        # Track ML prediction results for the dashboard
+        self.last_ml_predictions = {}
 
+    # ---------------------------------------------------------
+    # MAIN ENTRY POINT
+    # ---------------------------------------------------------
     def record(self, reading):
         """
-        Takes a new reading, verifies its signature, records it in the database,
-        and checks if it's an anomaly.
+        Process a new reading:
+          1. Verify its cryptographic signature.
+          2. Record it in the database.
+          3. Run Z-score detection.
+          4. Run ML-based detection.
+          5. If an attack is detected AND defense is active,
+             mark the reading as mitigated.
         """
         device_id = reading["device_id"]
         value = reading["consumption_kwh"]
@@ -30,22 +59,25 @@ class FDIDetector:
             conn = get_connection()
             cursor = conn.cursor()
 
-            verified = verify_signature(reading, signature)
+            # --- Cryptographic Signature Verification ---
+            verified, crypto_reason = verify_signature(reading, signature)
 
             if not verified:
-                print("Signature verification failed")
+                print(f"[CRYPTO DEFENSE] {crypto_reason} for device {device_id}")
                 cursor.execute(
                     """
                     INSERT INTO crypto_attacks
                     (device_id, timestamp, signature, verification_status)
                     VALUES (%s,%s,%s,%s)
                     """,
-                    (device_id, timestamp, signature, "FAILED")
+                    (device_id, timestamp, signature or "NONE", crypto_reason)
                 )
                 conn.commit()
-                return False
+                return {"detected": True, "type": "CRYPTO", "reason": crypto_reason,
+                        "mitigated": self.defense_active}
 
-            print("Device reading recorded")
+            # --- Record Valid Reading ---
+            print(f"[READING] Device {device_id}: {value} kWh")
             cursor.execute(
                 """
                 INSERT INTO energy_readings
@@ -55,63 +87,142 @@ class FDIDetector:
                 (device_id, value, timestamp, signature, is_fdi_attack)
             )
 
-            # Keep a rolling window of recent readings to figure out what "normal" looks like
+            # Update baselines for both detection methods
             self.update_baseline(device_id, value)
-            
-            # Run the statistical check
-            detected, z = self.detect(device_id, value)
+            self._collect_training_sample(device_id, value)
 
-            # If our math caught it OR if it was explicitly flagged as a simulated attack
-            if detected or is_fdi_attack:
-                reason = f"Z-score anomaly {z}" if detected else "FDI Attack Payload"
-                print("FDI attack detected")
+            # --- Z-Score Detection ---
+            z_detected, z_score = self.detect(device_id, value)
+
+            # --- ML Detection ---
+            ml_detected, ml_score = self.ml_predict(device_id, value)
+
+            # Combined verdict: either detector flags it, OR it was
+            # explicitly tagged as an FDI attack in the simulation
+            attack_detected = z_detected or ml_detected or is_fdi_attack
+
+            detection_reasons = []
+            if z_detected:
+                detection_reasons.append(f"Z-score={z_score}")
+            if ml_detected:
+                detection_reasons.append(f"ML-anomaly={ml_score:.3f}")
+            if is_fdi_attack and not (z_detected or ml_detected):
+                detection_reasons.append("Simulated FDI payload")
+
+            if attack_detected:
+                reason = " | ".join(detection_reasons)
+                mitigated = self.defense_active
+                status = "MITIGATED" if mitigated else "DETECTED"
+                print(f"[FDI {status}] {reason}")
+
                 cursor.execute(
                     """
                     INSERT INTO fdi_attacks
-                    (device_id, consumption_kwh, timestamp, detection_reason)
-                    VALUES (%s,%s,%s,%s)
+                    (device_id, consumption_kwh, timestamp, detection_reason, mitigated)
+                    VALUES (%s,%s,%s,%s,%s)
                     """,
-                    (device_id, value, timestamp, reason)
+                    (device_id, value, timestamp, reason, mitigated)
                 )
 
             conn.commit()
-            return detected or is_fdi_attack
+            return {
+                "detected": attack_detected,
+                "type": "FDI" if attack_detected else "NORMAL",
+                "z_score": z_score,
+                "ml_score": round(ml_score, 4) if ml_score else None,
+                "mitigated": self.defense_active if attack_detected else False,
+                "reasons": detection_reasons
+            }
         except Exception as e:
-            print(f"Error recording data: {e}")
-            return False
+            print(f"[ERROR] Recording data: {e}")
+            return {"detected": False, "type": "ERROR", "reason": str(e)}
         finally:
             if 'conn' in locals() and conn.is_connected():
                 conn.close()
 
+    # ---------------------------------------------------------
+    # Z-SCORE STATISTICAL DETECTION  (original logic)
+    # ---------------------------------------------------------
     def update_baseline(self, device_id, value):
-        """
-        Saves the most recent readings so we have a recent baseline to compare against.
-        Older readings fall off the end of the list.
-        """
+        """Keep a rolling window of recent readings for Z-score."""
         arr = self.baselines.setdefault(device_id, [])
         arr.append(value)
-
         self.baselines[device_id] = arr[-Config.BASELINE_WINDOW:]
 
     def detect(self, device_id, value):
-        """
-        The core anomaly detection math.
-        """
+        """Calculate Z-score and flag if it exceeds the threshold."""
         data = self.baselines.get(device_id, [])
-
-        # We need a minimum amount of data to establish a baseline
         if len(data) < Config.MIN_READINGS_FOR_DETECTION:
             return False, 0
 
-        # Calculate the average (mean) and variance (standard deviation)
         mean = np.mean(data)
         std = max(np.std(data), 0.1)
-
-        # Z-score measures how many standard deviations away from the mean this value is
         z = abs((value - mean) / std)
-
-        # If the Z-score is huge, it's an anomaly!
         return z > Config.ANOMALY_THRESHOLD, round(z, 2)
-    
-    # Debug print
-    print("running")
+
+    # ---------------------------------------------------------
+    # ISOLATION FOREST ML DETECTION
+    # ---------------------------------------------------------
+    def _collect_training_sample(self, device_id, value):
+        """Accumulate readings; retrain periodically."""
+        samples = self._training_data.setdefault(device_id, [])
+        samples.append(value)
+        # Keep a reasonable buffer
+        self._training_data[device_id] = samples[-500:]
+
+        # (Re)train after every batch of MIN_TRAINING_SAMPLES new points
+        if len(samples) >= Config.ML_MIN_TRAINING_SAMPLES and \
+           len(samples) % Config.ML_MIN_TRAINING_SAMPLES == 0:
+            self._train_model(device_id)
+
+    def _train_model(self, device_id):
+        """Train (or retrain) an Isolation Forest for the device."""
+        samples = self._training_data.get(device_id, [])
+        if len(samples) < Config.ML_MIN_TRAINING_SAMPLES:
+            return
+
+        X = np.array(samples).reshape(-1, 1)
+        model = IsolationForest(
+            contamination=Config.ML_CONTAMINATION,
+            random_state=42,
+            n_estimators=100
+        )
+        model.fit(X)
+        self._ml_models[device_id] = model
+        print(f"[ML] Isolation Forest trained for {device_id} "
+              f"({len(samples)} samples)")
+
+    def ml_predict(self, device_id, value):
+        """
+        Use the trained Isolation Forest to predict whether
+        the reading is an anomaly.
+        Returns (is_anomaly: bool, anomaly_score: float).
+        """
+        model = self._ml_models.get(device_id)
+        if model is None:
+            return False, 0.0
+
+        X = np.array([[value]])
+        prediction = model.predict(X)[0]       # 1 = normal, -1 = anomaly
+        score = model.score_samples(X)[0]       # lower = more anomalous
+
+        is_anomaly = prediction == -1
+        self.last_ml_predictions[device_id] = {
+            "value": value,
+            "prediction": int(prediction),
+            "score": round(score, 4)
+        }
+        return is_anomaly, score
+
+    def get_ml_status(self):
+        """Return a summary of the ML model state for the dashboard."""
+        status = {}
+        for device_id in self._training_data:
+            samples = len(self._training_data.get(device_id, []))
+            trained = device_id in self._ml_models
+            status[device_id] = {
+                "training_samples": samples,
+                "model_trained": trained,
+                "last_prediction": self.last_ml_predictions.get(device_id)
+            }
+        return status
