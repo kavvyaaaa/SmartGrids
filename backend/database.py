@@ -5,7 +5,7 @@ import mysql.connector
 # ---------------------------------------------------------
 
 def get_base_connection():
-    """Builds a raw connection to MySQL without selecting a specific database yet."""
+    
     return mysql.connector.connect(
         host="localhost",
         user="root",
@@ -13,10 +13,7 @@ def get_base_connection():
     )
 
 def init_db():
-    """
-    Creates the 'smartgrids' database if it doesn't exist, and builds
-    all the necessary tables for tracking devices and attacks.
-    """
+    
     try:
         conn = get_base_connection()
         cursor = conn.cursor()
@@ -81,8 +78,6 @@ def init_db():
                 FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
             )
         """)
-
-        # New table for JWT tampering events
         cursor.execute("""
             CREATE TABLE IF NOT EXISTS jwt_attacks (
                 id INT AUTO_INCREMENT PRIMARY KEY,
@@ -116,6 +111,6 @@ def get_connection():
     return mysql.connector.connect(
         host="localhost",
         user="root",
-        password="k123",
+        password="YOUR_PASSWORD",
         database="smartgrids"
     )
