@@ -66,6 +66,7 @@ def init_db():
                 consumption_kwh FLOAT,
                 timestamp TIMESTAMP,
                 detection_reason VARCHAR(255),
+                mitigated BOOLEAN DEFAULT FALSE,
                 FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
             )
         """)
@@ -80,6 +81,28 @@ def init_db():
                 FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
             )
         """)
+
+        # New table for JWT tampering events
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS jwt_attacks (
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                device_id VARCHAR(50),
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                attack_type VARCHAR(100),
+                token_snippet VARCHAR(50),
+                result VARCHAR(50),
+                FOREIGN KEY (device_id) REFERENCES devices(device_id) ON DELETE CASCADE
+            )
+        """)
+
+        # Add mitigated column if it doesn't exist (safe migration)
+        try:
+            cursor.execute("""
+                ALTER TABLE fdi_attacks ADD COLUMN mitigated BOOLEAN DEFAULT FALSE
+            """)
+            conn.commit()
+        except mysql.connector.errors.ProgrammingError:
+            pass  # Column already exists
 
         conn.commit()
     except Exception as e:
