@@ -5,20 +5,11 @@ from jwt_manager import JWTManager
 
 
 class AuthManager:
-    """
-    Authentication Manager
-    Handles creating and storing JWT (JSON Web Tokens) for devices 
-    so they can securely prove their identity.
-    """
-
     def __init__(self):
         self.jwt_manager = JWTManager()
 
     def authenticate(self, device_id):
-        """
-        Generates a new security token for a device and logs that
-        issuance into the database for auditing purposes.
-        """
+      
         try:
             token = self.jwt_manager.create_token(device_id)
 
