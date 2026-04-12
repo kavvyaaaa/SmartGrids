@@ -4,7 +4,7 @@ SecureGrids is a full-stack, event-driven cybersecurity simulation platform desi
 
 The system simulates a localized fleet of smart meters (residential, commercial, and industrial) that continuously transmit telemetry data, while a central detection engine intercepts, verifies, and analyzes incoming traffic to dynamically block malicious actors.
 
-## 🏗 System Architecture
+## System Architecture
 
 ```mermaid
 graph TD
@@ -29,6 +29,7 @@ graph TD
 SecureGrids implements a strict "never trust, always verify" layer model. 
 * **Continuous Authentication:** Devices must utilize active JWT authorizations.
 * **Cryptographic Integrity:** Payloads are hash-signed. Any discrepancy between the received signature and the calculated signature implies an active Man-In-The-Middle (M.I.T.M) attack.
+* **Active Isolation & Rate Limiting:** Devices that exhibit anomalous behavior or produce excessive compromised readings (e.g., 5 confirmed False Data Injections in 1 minute) are immediately and automatically isolated from the grid network.
 
 ### 2. Machine Learning Anomaly Detection
 The backend deploys an unsupervised **Isolation Forest** machine learning model.
@@ -47,7 +48,7 @@ The Python (`Flask`/`Flask-Sock`) backend operates asynchronously:
 
 ---
 
-## 🛠 Technology Stack
+## Tech Stack
 
 **Frontend (Client Layer)**
 * **Core:** React.js + Vite (JavaScript)
